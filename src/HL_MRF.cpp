@@ -633,43 +633,102 @@ void WHU::HL_MRF::globalCoarseRegistration(
 }
 
 /**
- * @brief 全局细配准流水线：MST 选边 -> 边上 ICP 精配准 -> 拼接位姿 -> LUM 全局图优化。
- * @param[in]  rejected_pairs_  不一致边集合
- * @param[in,out] matches      （输入）粗配准变换；（输出）可能被ICP更新
- * @param[in]  clouds           用于ICP/LUM的点云
- * @param[out] poses            每个子图内所有节点最终位姿（按原索引存放）
- * @param[out] num_of_subtrees  连通子图数量
+ * @brief 全局细配准流水线（MST 选边 → 边上 ICP 精配准 → 位姿拼接 → LUM 图优化）。
+ *
+ * @details
+ * 该函数在“全局粗配准 + 一致性推断”之后运行，假设已经得到可靠的配准边集合（去除了明显的不一致边）。
+ * 其内部包含四个步骤：
+ *  1) mstCalculation：在去除不一致边后，按连通子图计算最小生成树（Prim），并建立 LUM 的局部/全局索引映射；
+ *  2) pairwiseICP：仅在 MST 边上执行点到点 ICP 微调，更新匹配的相对变换；
+ *  3) concatenateFineRegistration：沿 DFS 路径累计边变换，得到每个子图相对于根的绝对位姿；
+ *  4) LUMoptimization：以上一步的绝对位姿为初值，执行 LUM 全局图优化，进一步整体细化。
+ *
+ * @param[in]  rejected_pairs_  从一致性推断得到的“拒绝边”索引集合（这些边会被忽略）。
+ * @param[in,out] matches       （输入）粗配准得到的边变换和打分；（输出）ICP 可能会更新其中的 transformation。
+ * @param[in]  clouds           参与 ICP/LUM 的（已下采样）点云集合，序号与扫描索引一致。
+ * @param[out] poses            每个连通子图的绝对位姿解（按全局索引存放，未出现的索引为 Zero()）。
+ * @param[out] num_of_subtrees  连通子图数量（= connected components 数目）。
+ *
+ * @pre 已调用 globalCoarseRegistration() 并完成不一致边剔除；
+ * @pre clouds 已按 voxel_size_icp 下采样；
+ * @post poses[f][i] 给出第 f 个子图中第 i 号扫描的绝对位姿（若 i 不在该子图中则为 Zero()）。
+ *
+ * @note 仅当 nr_scans ≥ 3 时才执行（小于 3 无法形成环也没有必要做 MST/LUM）。
+ * @see mstCalculation(), pairwiseICP(), concatenateFineRegistration(), LUMoptimization()
  */
-
 void WHU::HL_MRF::globalFineRegistration(std::set<int> &rejected_pairs_,
                                          std::vector<pcl::registration::MatchingCandidate, Eigen::aligned_allocator<pcl::registration::MatchingCandidate>> &matches,
                                          std::vector<pcl::PointCloud<PointT>::Ptr> &clouds,
                                          std::vector<std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>> &poses,
                                          int &num_of_subtrees)
 {
-    if (nr_scans >= 3)
+    if (nr_scans >= 3) // 仅在扫描数≥3时才有必要做 MST/ICP/LUM
     {
-        // temporary varible
-        std::vector<std::vector<int>> LUM_indices_map_;
-        std::vector<std::vector<int>> LUM_indices_map_inv_;
-        std::vector<std::vector<size_t>> edges;
-        std::vector<int> root;
-        std::vector<std::pair<int, int>> after_check_graph_pairs;
-        std::vector<pcl::registration::MatchingCandidate, Eigen::aligned_allocator<pcl::registration::MatchingCandidate>> after_check_matches;
-        std::vector<std::vector<pcl::Indices>> nodes_seqs;
+        // ===== 临时变量区（仅在本函数内使用）====================================
+        std::vector<std::vector<int>> LUM_indices_map_;                                                                                        // LUM：全局索引 -> 子图局部索引 的映射表（逐子图）
+        std::vector<std::vector<int>> LUM_indices_map_inv_;                                                                                    // LUM：子图局部索引 -> 全局索引 的反向映射表（逐子图）
+        std::vector<std::vector<size_t>> edges;                                                                                                // 每个子图的 MST 边集合（边用 after_check_graph_pairs 的下标标识）
+        std::vector<int> root;                                                                                                                 // 每个子图选择的根节点（全局索引）
+        std::vector<std::pair<int, int>> after_check_graph_pairs;                                                                              // 去除不一致边后的“边列表”（以全局节点索引存放）
+        std::vector<pcl::registration::MatchingCandidate, Eigen::aligned_allocator<pcl::registration::MatchingCandidate>> after_check_matches; // 与上面边一一对应的匹配结果
+        std::vector<std::vector<pcl::Indices>> nodes_seqs;                                                                                     // 每个子图内的 DFS 路径序列（用于位姿拼接）
 
-        mstCalculation(rejected_pairs_, matches, LUM_indices_map_, LUM_indices_map_inv_, edges, root, after_check_graph_pairs, after_check_matches, num_of_subtrees);
+        // ===== Step 1: 构图 + MST + LUM 索引映射 ==================================
+        // 作用：在去除不一致边后，按连通分量划分子图，对每个子图计算 MST；
+        //       同时建立 LUM 的局部/全局索引映射，方便后续图优化使用局部编号。
+        mstCalculation(rejected_pairs_, matches,
+                       LUM_indices_map_, LUM_indices_map_inv_,
+                       edges, root, after_check_graph_pairs, after_check_matches,
+                       num_of_subtrees);
+
+        // ===== Step 2: 边上 ICP 微调 ===============================================
+        // 作用：仅对 MST 边做点到点 ICP，利用粗配准结果作为初值，对 transformation 进行细化。
         pairwiseICP(edges, after_check_graph_pairs, after_check_matches, num_of_subtrees, clouds);
-        concatenateFineRegistration(edges, root, after_check_graph_pairs, after_check_matches, num_of_subtrees, poses, nodes_seqs);
-        LUMoptimization(poses, edges, root, nodes_seqs, LUM_indices_map_, LUM_indices_map_inv_, num_of_subtrees, clouds);
+
+        // ===== Step 3: 位姿拼接（从根出发，沿 DFS 路径连乘边变换）===================
+        // 作用：将“相对边变换”累乘为“相对于根的绝对位姿”，为 LUM 提供良好的初值。
+        concatenateFineRegistration(edges, root, after_check_graph_pairs, after_check_matches,
+                                    num_of_subtrees, poses, nodes_seqs);
+
+        // ===== Step 4: LUM 全局优化 =================================================
+        // 作用：以 Step 3 的绝对位姿为初值，在每个子图上进行 LUM 图优化，进一步整体收敛。
+        LUMoptimization(poses, edges, root, nodes_seqs,
+                        LUM_indices_map_, LUM_indices_map_inv_,
+                        num_of_subtrees, clouds);
     }
 }
 
 /**
- * @brief 在去除不一致边后构建图并按子图计算最小生成树（Prim），得到每个子图的根与边序列。
- * 同时建立 LUM 的全局-局部索引映射（LUM_indices_map_ / inv）。
+ * @brief 依据已过滤的一致性边构建子图并在每个连通子图上计算最小生成树（MST），
+ *        同时建立 LUM 优化所需的“全局索引 ↔ 子图局部索引”映射与 MST 边列表。
+ *
+ * @details
+ * 流程分为四步：
+ *  1) 使用 rejected_pairs_ 过滤掉不一致的图边，将剩余边加入全局图 G，并记录其匹配权重（fitness_score）。
+ *  2) 计算 G 的连通分量，将顶点划分到各个子图（connected components），统计子图个数 num_of_subtrees。
+ *  3) 为每个子图创建 Boost::subgraph，并将属于该子图的顶点（以“全局索引”）插入到子图（“局部索引”空间）。
+ *     将 after_check_graph_pairs 中位于该子图的边按“局部索引”加入子图，并写入边权重。
+ *  4) 在每个子图运行 Prim MST，抽取 MST 边，将“局部边索引”映射回“全局边索引”（对应 after_check_graph_pairs 的次序）。
+ *     同时构建 LUM_indices_map_ 与 LUM_indices_map_inv_，并为每个子图选取一个根（Prim 产生的根）。
+ *
+ * @param[in]  rejected_pairs_         需要忽略（已判定为不一致）的边在 pairs/matches 中的下标集合。
+ * @param[in,out] matches              所有候选匹配边（与全局 pairs 一一对应）；本函数会将被保留的边附加到 after_check_matches。
+ * @param[out] LUM_indices_map_        逐子图的“全局顶点索引 -> 子图局部顶点索引”映射（size=num_of_subtrees）。
+ * @param[out] LUM_indices_map_inv_    逐子图的“子图局部顶点索引 -> 全局顶点索引”反向映射（size=num_of_subtrees）。
+ * @param[out] edges                   逐子图的 MST 边索引列表；每个元素为 size_t，指向 after_check_graph_pairs/after_check_matches 的条目。
+ * @param[out] root                    逐子图的根节点（以全局顶点索引表示）。
+ * @param[out] after_check_graph_pairs 过滤后保留的“全局边”（顶点对），与 after_check_matches 一一对应。
+ * @param[out] after_check_matches     过滤后保留的匹配记录（与 after_check_graph_pairs 同步追加）。
+ * @param[out] num_of_subtrees         连通子图数量（connected components）。
+ *
+ * @pre  成员变量 nr_scans、nr_pairs、pairs 已正确初始化；matches 与 pairs 等长且一一对应。
+ * @post edges[i] 内的每个 size_t 均为 after_check_graph_pairs 的合法下标；LUM 索引映射完成初始化。
+ *
+ * @note
+ *  - 本函数不做 ICP 与 LUM 优化，仅构建 MST 与各种映射，为后续步骤提供结构与初值。
+ *  - 边权重使用 matches[i].fitness_score；若其语义是“越小越好”，Prim MST 将倾向选择拟合度更优的边。
+ *  - 使用 boost::subgraph 以便处理“全局/局部索引”问题：MST 在局部图上求解，再映射回全局。
  */
-
 void WHU::HL_MRF::mstCalculation(std::set<int> &rejected_pairs_,
                                  std::vector<pcl::registration::MatchingCandidate, Eigen::aligned_allocator<pcl::registration::MatchingCandidate>> &matches,
                                  std::vector<std::vector<int>> &LUM_indices_map_,
@@ -680,296 +739,417 @@ void WHU::HL_MRF::mstCalculation(std::set<int> &rejected_pairs_,
                                  std::vector<pcl::registration::MatchingCandidate, Eigen::aligned_allocator<pcl::registration::MatchingCandidate>> &after_check_matches,
                                  int &num_of_subtrees)
 {
-    typedef boost::subgraph<boost::adjacency_list<boost::vecS, boost::vecS, boost::undirectedS, boost::property<boost::vertex_index_t, int>, boost::property<boost::edge_index_t, int, boost::property<boost::edge_weight_t, float>>>> Graph;
-    // typedef boost::adjacency_list<boost::vecS, boost::vecS, boost::undirectedS > Graph;
-    Graph G(nr_scans);
+    Graph G(nr_scans); // 全局图：包含 nr_scans 个顶点（顶点索引约定与“全局扫描索引”一致）
 
     cout << "compute MST\n";
-    std::vector<float> weight;
+    std::vector<float> edge_weights; // 与 after_check_graph_pairs/after_check_matches 的顺序严格一致的边权重数组
+    edge_weights.reserve(static_cast<size_t>(nr_pairs));
+    after_check_graph_pairs.reserve(static_cast<size_t>(nr_pairs));
+    after_check_matches.reserve(static_cast<size_t>(nr_pairs));
+    // === 1) 过滤不一致边并构建全局图 G ===
     for (std::size_t i = 0; i < nr_pairs; i++)
     {
-        if (rejected_pairs_.size() != 0)
+        if (!rejected_pairs_.empty())
         {
-            if (find(rejected_pairs_.begin(), rejected_pairs_.end(), i) != rejected_pairs_.end())
+            // 如果边 i 在拒绝集合中，则跳过
+            if (find(rejected_pairs_.begin(), rejected_pairs_.end(), static_cast<int>(i)) != rejected_pairs_.end())
             {
-                cout << "ignore" << i << ", it's rejected" << endl;
+                cout << "ignore " << i << ", it's rejected" << endl;
                 continue;
             }
         }
+
+        // 从 pairs 取全局端点索引
         const int &src = pairs[i].first;
         const int &tgt = pairs[i].second;
-        add_edge(src, tgt, G);
-        weight.push_back(matches[i].fitness_score);
-        after_check_matches.push_back(matches[i]);
-        after_check_graph_pairs.push_back(std::make_pair(src, tgt));
+
+        add_edge(src, tgt, G);                                       // 在全局图中加入边（不设置权重；权重只在子图上用）
+        edge_weights.push_back(matches[i].fitness_score);            // 记录该边的权重（与 after_check_* 一致）
+        after_check_matches.push_back(matches[i]);                   // 记录过滤后保留的匹配
+        after_check_graph_pairs.push_back(std::make_pair(src, tgt)); // 同步记录过滤后保留的边（全局端点）
     }
+    const size_t kept_edges = after_check_graph_pairs.size();
+    cout << "[MST] build global graph | scans=" << nr_scans
+         << " | candidate_edges=" << nr_pairs
+         << " | kept=" << kept_edges << endl;
+
+    // === 2) 连通分量划分 ===
     std::cout << "component calculation...";
-    std::vector<int> component(num_vertices(G));
+    std::vector<int> component(num_vertices(G));              // component[v] = 子图编号
+    num_of_subtrees = connected_components(G, &component[0]); // 统计子图个数
+    edges.resize(num_of_subtrees);                            // 为每个子图预留 MST 边列表
 
-    num_of_subtrees = connected_components(G, &component[0]);
-    edges.resize(num_of_subtrees);
-
-    cout << "subgraphs size: " << num_of_subtrees;
-    std::vector<std::vector<int>> subgraph_vertices(num_of_subtrees);
-    // cout << component.size();
-    for (int i = 0; i < component.size(); i++)
+    cout << "subgraphs size: " << num_of_subtrees << endl;
+    std::vector<std::vector<int>> subgraph_vertices(num_of_subtrees); // 每个子图包含的“全局顶点索引”列表
+    for (int i = 0; i < static_cast<int>(component.size()); i++)
     {
-        subgraph_vertices[component[i]].push_back(i);
-        // cout << component[i] << ": " << i << "\t";
+        subgraph_vertices[component[i]].push_back(i); // 将全局顶点 i 放入其所属子图的顶点列表
     }
 
-    // to address the vertex&edge descriptor issue (global <-> local)
-    // LUM use local descriptor
-    Graph G_r(nr_scans);
-    Graph *subgraphs = new Graph[num_of_subtrees];
-
-    for (int i = 0; i < num_of_subtrees; i++)
+    // === 3) 创建子图并将子图内顶点（以全局索引）插入到各自子图（转为局部索引）===
+    // 说明：为了后续调用 prim_minimum_spanning_tree，需要在子图空间中添加边与权重。
+    Graph base(nr_scans);           // “根”图（用于创建子图）
+    std::vector<Graph *> subgraphs; // 保存子图指针
+    for (int c = 0; c < num_of_subtrees; ++c)
     {
-        Graph &g_s = G_r.create_subgraph();
-        for (int j = 0; j < subgraph_vertices[i].size(); j++)
+        Graph &sg = base.create_subgraph(); // 基于根图创建一个子图
+        for (int gv : subgraph_vertices[static_cast<size_t>(c)])
         {
-            // cout << subgraph_vertices[i][j] << "\t";
-            boost::add_vertex(subgraph_vertices[i][j], g_s);
-            // cout <<v;
+            // 将“全局顶点索引”加入到子图中（内部会分配一个“局部顶点索引”）
+            boost::add_vertex(gv, sg);
         }
-        // cout << "number of vertex of subgraphs: " << boost::num_vertices(g_t);
-
-        cout << "\n";
-        subgraphs[i] = g_s;
+        subgraphs.push_back(&sg);
     }
 
-    for (std::size_t i = 0; i < after_check_graph_pairs.size(); i++)
+    // === 4)把“保留的全局边”分派到各自子图，并设置权重 ----------
+    for (size_t i = 0; i < kept_edges; ++i)
     {
-        int g_s = component[after_check_graph_pairs[i].first];
-        boost::property_map<Graph, boost::edge_weight_t>::type weightmap = boost::get(boost::edge_weight, subgraphs[g_s]);
-        std::size_t src = subgraphs[g_s].global_to_local(after_check_graph_pairs[i].first);
-        std::size_t tgt = subgraphs[g_s].global_to_local(after_check_graph_pairs[i].second);
-        // cout<<src<<"\t";
-        // cout<<tgt<<"\n";
-        boost::graph_traits<Graph>::edge_descriptor e;
-        bool inserted;
+        // 找到该边所属的子图编号（利用起点在 component 中的标记）
+        const int u = after_check_graph_pairs[i].first;
+        const int v = after_check_graph_pairs[i].second;
+        const int c = component[u];
 
-        boost::tie(e, inserted) = boost::add_edge(src, tgt, subgraphs[g_s]);
-        weightmap[e] = weight[i];
+        // 取该子图的“边权重属性图”
+        Graph &sg = *subgraphs[static_cast<size_t>(c)];
+        boost::property_map<Graph, boost::edge_weight_t>::type weightmap = boost::get(boost::edge_weight, sg);
+
+        // 将全局端点索引映射到子图的“局部顶点索引”
+        const size_t src = sg.global_to_local(u);
+        const size_t tgt = sg.global_to_local(v);
+
+        boost::graph_traits<Graph>::edge_descriptor e_desc;
+        bool inserted = false;
+        boost::tie(e_desc, inserted) = boost::add_edge(src, tgt, sg); // 在子图（局部索引）中加边
+        weightmap[e_desc] = edge_weights[i];                          // 设置该边的权重（顺序与 after_check_* 对齐）
+        (void)inserted;                                               // 抑制未使用告警（逻辑上 inserted 一般应为 true）
     }
     cout << "--> find MST edges: \n";
 
+    // === 4) Prim MST & 建立 LUM 索引映射（全局 <-> 局部）===
     LUM_indices_map_.resize(num_of_subtrees);
     LUM_indices_map_inv_.resize(num_of_subtrees);
     for (int i = 0; i < num_of_subtrees; i++)
     {
+        // 为简单起见，初始化为 nr_scans 长度；未使用位置保持默认值 0（后续逻辑仅访问子图内的条目）
         LUM_indices_map_[i].resize(nr_scans, 0);
         LUM_indices_map_inv_[i].resize(nr_scans, 0);
     }
-    std::vector<std::vector<boost::graph_traits<Graph>::vertex_descriptor>> p(num_of_subtrees);
-    for (int i = 0; i < num_of_subtrees; i++)
-    {
-        p[i].resize(boost::num_vertices(subgraphs[i]));
-        if (boost::num_vertices(subgraphs[i]) == 1)
-            continue;
-        boost::prim_minimum_spanning_tree(subgraphs[i], &p[i][0]);
-    }
 
-    for (int i = 0; i < num_of_subtrees; i++)
+    // Prim MST生成
+    // p[i][v_local] = 该子图的 Prim 生成树中 v_local 的父结点（局部索引）；
+    // 若 p[i][v]==v，则 v 是根
+    std::vector<std::vector<boost::graph_traits<Graph>::vertex_descriptor>> p(num_of_subtrees);
+    for (int c = 0; c < num_of_subtrees; c++)
     {
-        boost::property_map<Graph, boost::edge_index_t>::type edgemap = boost::get(boost::edge_index, subgraphs[i]);
+        Graph &sg = *subgraphs[static_cast<size_t>(c)]; // 子图
+        const size_t nv = num_vertices(sg);             // 子图顶点个数
+        p[c].resize(nv);
+        if (nv == 1)
+            continue;                                    // 单独一个顶点时无需求 MST
+        boost::prim_minimum_spanning_tree(sg, &p[c][0]); // 在子图 c 上做 Prim
+    }
+    for (int c = 0; c < num_of_subtrees; c++)
+    {
+        Graph &sg = *subgraphs[static_cast<size_t>(c)]; // 子图
+        const size_t nv = num_vertices(sg);             // 子图顶点个数
+        // 边索引属性：用于把“局部边 (u,v)”映射到 after_check_graph_pairs 的全局边下标
+        boost::property_map<Graph, boost::edge_index_t>::type edgemap = boost::get(boost::edge_index, sg);
+        // 获取该子图的权重属性映射
+        auto weightmap = get(boost::edge_weight, sg);
         cout << "\tMST: ";
-        for (int j = 0; j < p[i].size(); j++)
+        for (int j = 0; j < nv; j++)
         {
-            LUM_indices_map_[i][subgraphs[i].local_to_global(j)] = j;
-            LUM_indices_map_inv_[i][j] = subgraphs[i].local_to_global(j);
-            if (p[i][j] == j)
+            // 维护 LUM 的双向索引映射
+            // local_to_global(j) 将“局部顶点 j”映射回“全局顶点索引”
+            LUM_indices_map_[c][sg.local_to_global(j)] = j;     // 全局->局部
+            LUM_indices_map_inv_[c][j] = sg.local_to_global(j); // 局部->全局
+
+            if (p[c][j] == static_cast<boost::graph_traits<Graph>::vertex_descriptor>(j))
             {
-                cout << "root: " << p[i][j] << "\n";
-                root.push_back(subgraphs[i].local_to_global(j));
+                // p[i][j]==j 说明 j 是 Prim 的根
+                cout << "root: " << p[c][j] << "\n";
+                root.push_back(sg.local_to_global(j)); // 记录“全局根索引”
                 continue;
             }
 
-            // cout<<boost::edge(p[i][j],size_t(j),subgraphs[i]).second;
-            edges[i].push_back(edgemap[boost::edge(p[i][j], size_t(j), subgraphs[i]).first]);
+            // 当前 MST 边 (p[c][j], j) 在局部子图中的表示
+            auto [e_desc, ok] = boost::edge(p[c][j], static_cast<size_t>(j), sg);
+            // 获取该边的权重
+            float w = weightmap[e_desc];
 
-            std::cout << subgraphs[i].local_to_global(boost::edge(p[i][j], size_t(j), subgraphs[i]).first) << "\t";
+            // 将 Prim 产生的局部树边 (p[i][j], j) 转换为“全局边下标”
+            // boost::edge(u_local, v_local, subgraph) 返回 (edge_descriptor, bool)
+            edges[c].push_back(edgemap[e_desc]);
+
+            // 转换为全局索引
+            int gu = sg.local_to_global(p[c][j]);
+            int gv = sg.local_to_global(j);
+            // 输出 MST 边及其权重
+            cout << "  edge: " << gu << " -- " << gv << " , weight=" << w << endl;
         }
         cout << endl;
     }
-
-    delete[] subgraphs;
-    // std::vector<int> count(num_of_subtrees + 1);
-
-    // i ->global, count ->local
-    //  for (int i = 0; i < nr_scans; i++)
-    //  {
-
-    // 	if (pred[i] == graph.numberOfEdges())
-    // 	{
-    // 		LUM_indices_map_inv_[component[i]][count[component[i]]] = i;
-    // 		LUM_indices_map_[component[i]][i] = count[component[i]]++;
-    // 		continue;
-    // 	}
-    // 	edges[component[i]].push_back(pred[i]);
-    // 	LUM_indices_map_inv_[component[i]][count[component[i]]] = i;
-    // 	LUM_indices_map_[component[i]][i] = count[component[i]]++;
-
-    // 	cout << component[i] << ": " << pred[i] << "\t";
-    // }
 }
 
-/**
- * @brief 在 MST 边上做点到点 ICP 微调（以 GROR 输出为初值）。
- * @details setMaxCorrespondenceDistance=voxel_size_icp，迭代次数为10。
- *          更新 after_check_matches[edge].transformation。
- */
 
-void WHU::HL_MRF::pairwiseICP(std::vector<std::vector<size_t>> &edges,
-                              std::vector<std::pair<int, int>> &after_check_graph_pairs,
-                              std::vector<pcl::registration::MatchingCandidate, Eigen::aligned_allocator<pcl::registration::MatchingCandidate>> &after_check_matches,
-                              int &num_of_subtrees,
-                              std::vector<pcl::PointCloud<PointT>::Ptr> &clouds)
+ /**
+  * @brief 在每个连通子图（connected component）的 **MST 边** 上执行点到点 ICP 微调。
+  *
+  * @details
+  * 输入的 @p edges 为“逐子图的边索引列表”，每条边索引指向
+  * @p after_check_graph_pairs / @p after_check_matches 的同一位置（即过滤后保留的边）。
+  * 函数以 GROR 粗配准得到的相对变换（@p after_check_matches[edge].transformation）作为 **初始位姿**，
+  * 仅对该条边关联的两幅点云做 **点到点 ICP**，并将优化后的变换回写到
+  * @p after_check_matches[edge].transformation。
+  *
+  * 并行策略：对每个子图 f 的边列表使用 OpenMP 并行 `for`；每次迭代仅写回该边在
+  * @p after_check_matches 中对应的元素，互不冲突。注意：`std::cout` 的输出在并行区可能交错。
+  *
+  * @param[in]      edges                    逐子图的 MST 边索引；edges[f][i] 是 after_check_* 的下标。
+  * @param[in]      after_check_graph_pairs  过滤后保留的“全局边”（两端为全局扫描索引），与 after_check_matches 对齐。
+  * @param[in,out]  after_check_matches      每条保留边的配准结果（含 transformation），将被 ICP 更新。
+  * @param[in]      num_of_subtrees          连通子图数量（由 MST 计算阶段得到）。
+  * @param[in]      clouds                   参与 ICP 的点云数组（与“全局扫描索引”对齐，通常已按 voxel_size_icp 下采样）。
+  *
+  * @pre  已完成粗配准与一致性推断，并通过 mstCalculation() 产出 @p edges 与 after_check_*。
+  * @post 对每条 MST 边，@p after_check_matches[edge].transformation 被 ICP 结果覆盖。
+  *
+  * @note
+  * - ICP 参数：最大对应距离 = @c voxel_size_icp；最大迭代 @c 10；使用互惠对应；
+  *   收敛判据 @c EuclideanFitnessEpsilon = 1e-2。
+  * - 本实现将点云复制为 `pcl::PointXYZ` 类型，以与类内别名 `PointT=pcl::PointXYZ` 保持一致。
+  * - 若需替换为更高层的匹配器（如基于已保存索引的细配准），可将下方 `if (1)` 作为开关位。
+  *
+  * @thread_safety  每次循环仅写回 `after_check_matches` 的一个独立元素；打印建议使用 `#pragma omp critical` 包裹以避免交错。
+  * @complexity     设子图 f 的 MST 边数为 E_f，则总体约为 sum_f O(E_f * N_icp)，其中 N_icp 为 ICP 迭代成本。
+  */
+void WHU::HL_MRF::pairwiseICP(std::vector<std::vector<size_t>>& edges,
+    std::vector<std::pair<int, int>>& after_check_graph_pairs,
+    std::vector<pcl::registration::MatchingCandidate, Eigen::aligned_allocator<pcl::registration::MatchingCandidate>>& after_check_matches,
+    int& num_of_subtrees,
+    std::vector<pcl::PointCloud<PointT>::Ptr>& clouds)
 {
+    // 遍历每个连通子图（由 MST 阶段得到）
     for (int f = 0; f < num_of_subtrees; f++)
     {
-        if (edges[f].size() == 0)
+        // 若该子图没有 MST 边，直接跳过（单节点子图或异常情况）
+        if (edges[f].empty())
             continue;
-#pragma omp parallel for num_threads(num_threads)
-        for (int i = 0; i < edges[f].size(); i++)
-        {
 
-            cout << "pairwise icp process ";
-            cout << "edge: " << edges[f][i] << endl;
-            // normal icp matching or higher level mathcing using saved indices
+        // 在子图 f 内对每条 MST 边并行执行 ICP
+#pragma omp parallel for num_threads(num_threads)
+        for (int i = 0; i < static_cast<int>(edges[f].size()); i++)
+        {
+            // 取到全局“边下标”，它同时索引 after_check_graph_pairs / after_check_matches
+            const size_t edge_idx = edges[f][static_cast<size_t>(i)];
+
+            // 仅用于日志：打印边号（注意并行输出可能交错）
+            std::cout << "pairwise icp process edge: " << edge_idx << std::endl;
+
+            // 预留开关：若未来要接入“保存了对应索引的高层匹配”，可在此切换分支
             if (1)
             {
+                // 按照“全局边”找到两端扫描的全局 ID（src, tgt）
+                const int src_id = after_check_graph_pairs[edge_idx].first;   // 源扫描索引（全局）
+                const int tgt_id = after_check_graph_pairs[edge_idx].second;  // 目标扫描索引（全局）
 
-                pcl::PointCloud<pcl::PointXYZ>::Ptr temp(new pcl::PointCloud<pcl::PointXYZ>);
-                pcl::PointCloud<pcl::PointXYZ>::Ptr temp2(new pcl::PointCloud<pcl::PointXYZ>);
-                pcl::copyPointCloud(*clouds[after_check_graph_pairs[edges[f][i]].first], *temp);
-                pcl::copyPointCloud(*clouds[after_check_graph_pairs[edges[f][i]].second], *temp2);
+                // 复制两端点云到临时缓冲（类型 pcl::PointXYZ），避免直接修改原数组
+                pcl::PointCloud<pcl::PointXYZ>::Ptr src(new pcl::PointCloud<pcl::PointXYZ>);
+                pcl::PointCloud<pcl::PointXYZ>::Ptr tgt(new pcl::PointCloud<pcl::PointXYZ>);
+                pcl::copyPointCloud(*clouds[src_id], *src);
+                pcl::copyPointCloud(*clouds[tgt_id], *tgt);
 
-                // pcl::transformPointCloud(*temp, *temp, after_check_matches[edges[f][i]].transformation);
-                // CCCoreLib::ICPRegistrationTools::Parameters params;
-                // params.finalOverlapRatio = approx_overlap;
-                // params.maxThreadCount = 1;
-
-                // ICP icp;
+                // 这里保留了若干被注释掉的实现（如 CCCoreLib ICP/重叠率等），作为备选思路。
+                // 当前版本使用 PCL IterativeClosestPoint 进行点到点 ICP。
                 pcl::IterativeClosestPoint<PointT, PointT> icp;
-                if (!temp->empty() && !temp2->empty())
+
+                // 若任一端为空则跳过本条边（常见于前序过滤或数据异常）
+                if (!src->empty() && !tgt->empty())
                 {
-                    // icp.setInputCloud(temp, temp2);
-                    // icp.setParameters(params);
-                    // icp.align();
-                    // after_check_matches[edges[f][i]].transformation = icp.getFinalTransformation() * after_check_matches[edges[f][i]].transformation;
-                    icp.setInputSource(temp);
-                    icp.setInputTarget(temp2);
+                    // === ICP 参数设置 ===
+                    // 源/目标点云
+                    icp.setInputSource(src);
+                    icp.setInputTarget(tgt);
+
+                    // 最大对应距离（单位：m），取类成员 voxel_size_icp；过小可能不收敛，过大易受外点影响
                     icp.setMaxCorrespondenceDistance(voxel_size_icp);
+
+                    // 启用互惠对应（Reciprocal），通常能提升匹配的稳定性但略增计算
                     icp.setUseReciprocalCorrespondences(true);
+
+                    // 迭代上限与收敛判据（欧氏误差阈值）
                     icp.setMaximumIterations(10);
-                    icp.setEuclideanFitnessEpsilon(10e-3);
-                    icp.align(*temp, after_check_matches[edges[f][i]].transformation);
-                    after_check_matches[edges[f][i]].transformation = icp.getFinalTransformation();
-                    cout << after_check_graph_pairs[edges[f][i]].first << "--" << after_check_graph_pairs[edges[f][i]].second << "\n";
-                    cout << after_check_matches[edges[f][i]].transformation << "\n";
+                    icp.setEuclideanFitnessEpsilon(10e-3); // 1e-2，注意这是欧氏 fitness 的收敛阈值
+
+                    // === 对齐执行 ===
+                    // 传入 GROR 的相对位姿作为“初始变换”，能显著加快收敛并提高稳定度
+                    icp.align(*src, after_check_matches[edge_idx].transformation);
+
+                    // 将最终估计结果回写到该边的 transformation
+                    after_check_matches[edge_idx].transformation = icp.getFinalTransformation();
+
+                    // 打印该边两端的全局索引与最终变换（并行环境下输出顺序可能交错）
+                    std::cout << src_id << " -- " << tgt_id << "\n";
+                    std::cout << after_check_matches[edge_idx].transformation << "\n";
                 }
                 else
                 {
-                    cout << "ignore" << i << "because one of them is nullptr!";
+                    // 若数据为空，给出提示（并携带循环内 i 方便定位）
+                    std::cout << "ignore " << i << " because one of clouds is empty!\n";
                 }
+            } // if(1)
+        }     // for edges[f]
 
-                // pcl::IterativeClosestPoint<PointT, PointT> icp;
-                // pcl::PointCloud<PointT>::Ptr temp(new PointCloud<PointT>());
-                // icp.setInputSource(clouds[after_check_graph_pairs[edges[f][i]].first]);
-                // icp.setInputTarget(clouds[after_check_graph_pairs[edges[f][i]].second]);
-                ////icp.setInputSource(clouds[pairs[i].first]);
-                ////icp.setInputTarget(clouds[pairs[i].second]);
-                // icp.setMaxCorrespondenceDistance(atof(argv[11]));
-                // icp.setMaximumIterations(atoi(argv[9]));
-                // icp.setEuclideanFitnessEpsilon(0.001);
-                // icp.setUseReciprocalCorrespondences(true);
-                // icp.align(*temp, after_check_matches[edges[f][i]].transformation);
-                // after_check_matches[edges[f][i]].transformation = icp.getFinalTransformation();
-                // cout << after_check_graph_pairs[edges[f][i]].first << "--" << after_check_graph_pairs[edges[f][i]].second << "\n";
-                // cout << after_check_matches[edges[f][i]].transformation << "\n";
-                // cout << "has converged ? " << icp.hasConverged() << "\n";
-            }
-        }
-        cout << "icp complete\n";
-    }
+        std::cout << "icp complete\n";
+    } // for subtrees
 }
 
 /**
- * @brief 以 DFS 的路径顺序把边变换串联起来，得到相对于根节点的绝对位姿 poses。
- * @details 构造邻接表 Mst 和一个 (i*nr_scans + j)->(edge_id, forward?) 的索引表 map_，
- *          遍历所有叶子路径，对每条路径依次左乘边变换（或其逆）。
+ * @brief 以每个连通子图的 MST 边为约束，将两两配准（ICP/GROR 等）的相对位姿
+ *        “沿树累乘”拼接为**全局（以根为参考）**的姿态解，并输出遍历路径。
+ *
+ * @details
+ * - 输入的 @p edges 是“逐子图（connected component）”的边索引列表；
+ *   其中 edges[f][i] 是对 after_check_graph_pairs / after_check_matches 的**统一下标**。
+ * - 对于每个子图 f：
+ *    1. 若该子图无边（单节点子图），则仅将根结点 root[f] 的位姿置为单位阵，其余置零矩阵，
+ *       并推入 @p poses 与 @p nodes_seqs。
+ *    2. 否则由 edges[f] 构建子图 f 的无向邻接表 Mst，并构造一张“有向边索引表” map_，
+ *       用于在 DFS/拼接阶段根据 (u,v) 查得对应的全局边索引 edge_idx 以及方向标记（u->v 是否为正向）。
+ *    3. 调用 depthfirstsearch(...) 从根 root[f] 出发生成所有“从根到各结点”的路径序列 nodes_seq；
+ *    4. 调用 combineTransformation(...)：沿每条路径将相对位姿累计为“相对根”的全局位姿，
+ *       结果写入 poses_t（长度 = nr_scans），并将其推入输出容器 @p poses。
+ *
+ * 约定与约束：
+ * - @p after_check_graph_pairs[edge_idx] = {u, v} 给出边的两端全局扫描 ID（u、v ∈ [0, nr_scans)）。
+ * - @p after_check_matches[edge_idx].transformation 存放 **u→v** 的相对变换（或以此为准的初值），
+ *   在 combineTransformation 中会依据 map_ 的方向标记决定使用正向或其逆。
+ * - @p poses 的 push_back 维度为“子图级别”，即 poses[f][scan_id] 是该子图内某扫描相对于 root[f] 的位姿；
+ *   不在该子图中的 scan_id 位置通常保持为 Zero（未赋值）。
+ *
+ * @param[in]      edges                    逐子图的边索引列表；edges[f][i] 是 after_check_* 的索引。
+ * @param[in]      root                     每个子图的根结点全局索引（作为参考坐标系）。
+ * @param[in]      after_check_graph_pairs  过滤后的“全局边（u,v）”数组，与 after_check_matches 对齐。
+ * @param[in]      after_check_matches      每条边的配准结果（含 transformation），供拼接使用。
+ * @param[in]      num_of_subtrees          连通子图数量。
+ * @param[out]     poses                    输出：逐子图的全局位姿数组（长度 nr_scans，root 为 I，其余为累乘结果或 Zero）。
+ * @param[out]     nodes_seqs               输出：逐子图的 DFS 路径集合；每个元素是一条从 root 出发到某节点的“节点序列”。
+ *
+ * @pre  已完成 MST 计算并得到了子图划分（root 与 edges），且 after_check_* 二者相互对齐。
+ * @post poses.size() 与 nodes_seqs.size() 各自增加 num_of_subtrees 个元素。
+ *
+ * @note
+ * - poses_t 中使用 `Eigen::Matrix4f::Zero()` 表示“未赋值/未知”，`Identity()` 表示“相对于根的单位位姿”。
+ * - Mst_trans 在当前实现中仅预留，未实际使用；如需导出“边上的相对变换”序列，可在 combineTransformation 内部填充。
+ * - depthfirstsearch / combineTransformation 为类内辅助方法：前者构建从根出发的路径，后者按路径串接相对变换。
  */
-
-void WHU::HL_MRF::concatenateFineRegistration(std::vector<std::vector<size_t>> &edges,
-                                              std::vector<int> &root,
-                                              std::vector<std::pair<int, int>> &after_check_graph_pairs,
-                                              std::vector<pcl::registration::MatchingCandidate, Eigen::aligned_allocator<pcl::registration::MatchingCandidate>> &after_check_matches,
-                                              int &num_of_subtrees,
-                                              std::vector<std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>> &poses,
-                                              std::vector<std::vector<pcl::Indices>> &nodes_seqs)
+void WHU::HL_MRF::concatenateFineRegistration(std::vector<std::vector<size_t>>& edges,
+    std::vector<int>& root,
+    std::vector<std::pair<int, int>>& after_check_graph_pairs,
+    std::vector<pcl::registration::MatchingCandidate, Eigen::aligned_allocator<pcl::registration::MatchingCandidate>>& after_check_matches,
+    int& num_of_subtrees,
+    std::vector<std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>>& poses,
+    std::vector<std::vector<pcl::Indices>>& nodes_seqs)
 {
+    // 逐子图处理
     for (int f = 0; f < num_of_subtrees; f++)
     {
         std::stringstream ss;
         ss << f;
+
+        //========================
+        // 情况 A：该子图没有任何边（单节点或异常）
+        //========================
         if (edges[f].size() == 0)
         {
-            std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> poses_t(nr_scans, Eigen::Matrix4f::Zero());
-            poses_t[root[f]] = Eigen::Matrix4f::Identity();
-            poses.push_back(poses_t);
+            // poses_t：长度 = nr_scans；非本子图中的节点保持 Zero，本子图根设置为 I
+            std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
+                poses_t(nr_scans, Eigen::Matrix4f::Zero());
+            poses_t[root[f]] = Eigen::Matrix4f::Identity();  // 根结点作为参考坐标系
+
+            poses.push_back(poses_t);  // 输出该子图的位姿解
+
+            // nodes_seq：空（无路径）
             std::vector<pcl::Indices> nodes_seq;
             nodes_seqs.push_back(nodes_seq);
-            /*ofstream ofs2(R"(D:\Programming\global_consistency\build\result\concatenate registration)" + filename.str() + "_Mst" + ss.str() + ".txt");
 
-            for (auto& pose : poses_t)
-            {
-                cout << pose << endl;
-                ofs2 << pose << endl;
-            }
-            ofs2.close();*/
-            continue;
+            // （可选）历史调试输出留存，当前注释掉
+            /*
+            ofstream ofs2(".../concatenate registration" + filename.str() + "_Mst" + ss.str() + ".txt");
+            for (auto& pose : poses_t) { std::cout << pose << std::endl; ofs2 << pose << std::endl; }
+            ofs2.close();
+            */
+            continue; // 进入下一个子图
         }
 
+        //========================
+        // 情况 B：常规子图（含若干条 MST 边）
+        //========================
+
+        // 预留：若希望记录“边级别的相对变换链”，可利用此数组；当前未使用
         std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> Mst_trans(nr_scans - 1);
+
+        // 构建无向邻接表 Mst（按全局节点索引组织）
         std::vector<pcl::Indices> Mst(nr_scans);
-        for (int i = 0; i < edges[f].size(); i++)
+        for (int i = 0; i < static_cast<int>(edges[f].size()); i++)
         {
-            Mst[after_check_graph_pairs[edges[f][i]].first].push_back(after_check_graph_pairs[edges[f][i]].second);
-            Mst[after_check_graph_pairs[edges[f][i]].second].push_back(after_check_graph_pairs[edges[f][i]].first);
+            // 取到该 MST 边在“全局边数组”中的下标
+            const size_t edge_idx = edges[f][static_cast<size_t>(i)];
+            // 拿到该边的两个端点（全局扫描 ID）
+            const int u = after_check_graph_pairs[edge_idx].first;
+            const int v = after_check_graph_pairs[edge_idx].second;
+
+            // 无向图邻接：u<->v
+            Mst[u].push_back(v);
+            Mst[v].push_back(u);
         }
+
+        // 构建“有向边索引表” map_：
+        // map_[u * nr_scans + v] = { edge_idx, true }   表示取正向（u->v）
+        // map_[v * nr_scans + u] = { edge_idx, false }  表示取反向（v->u，需要在拼接时取逆）
         std::vector<std::pair<int, bool>> map_(nr_scans * nr_scans);
         for (std::size_t i = 0; i < edges[f].size(); i++)
         {
-            map_[after_check_graph_pairs[edges[f][i]].first * nr_scans + after_check_graph_pairs[edges[f][i]].second] = std::make_pair(static_cast<int>(edges[f][i]), true);
-            map_[after_check_graph_pairs[edges[f][i]].second * nr_scans + after_check_graph_pairs[edges[f][i]].first] = std::make_pair(static_cast<int>(edges[f][i]), false);
+            const size_t edge_idx = edges[f][i];
+            const int u = after_check_graph_pairs[edge_idx].first;
+            const int v = after_check_graph_pairs[edge_idx].second;
+
+            map_[u * nr_scans + v] = std::make_pair(static_cast<int>(edge_idx), true);   // 正向
+            map_[v * nr_scans + u] = std::make_pair(static_cast<int>(edge_idx), false);  // 反向
         }
 
-        std::vector<pcl::Indices> nodes_seq;
-        std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> poses_t(nr_scans, Eigen::Matrix4f::Zero());
+        // DFS 生成从 root[f] 出发到各节点的“路径序列集合”
+        std::vector<pcl::Indices> nodes_seq;  // nodes_seq[k] 是一条路径（节点索引序列）
+        std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
+            poses_t(nr_scans, Eigen::Matrix4f::Zero()); // 输出位姿缓冲（先置零）
+
         depthfirstsearch(nr_scans, root[f], Mst, map_, nodes_seq);
-        cout << "depth search complete\n";
-        for (std::vector<int> item : nodes_seq)
+        std::cout << "depth search complete\n";
+
+        // （可选）打印每条从根到节点的路径；用于验证 DFS 结果
+        for (const std::vector<int>& item : nodes_seq)
         {
-            cout << "road :";
+            std::cout << "road :";
             for (int i : item)
-            {
-                cout << i << "\n";
-            }
-            cout << "\n";
+                std::cout << i << "\n";
+            std::cout << "\n";
         }
+
+        // 将 pairwise 变换沿每条路径进行累乘，得到相对于根的“全局位姿解”，写入 poses_t
+        // 注意：combineTransformation 会使用 map_ 中的方向布尔值决定使用 T(u->v) 还是其逆
         combineTransformation(nr_scans, root[f], nodes_seq, map_, after_check_matches, poses_t);
-        cout << "root " << root[f] << " is the reference frame :\n";
-        // ofstream ofs2(R"(D:\Programming\global_consistency\build\result\concatenate registration)" + filename.str() + "_Mst" + ss.str() + ".txt");
 
-        for (Eigen::Matrix4f &pose : poses_t)
+        std::cout << "root " << root[f] << " is the reference frame :\n";
+
+        // （可选）打印该子图内所有节点的最终位姿（Zero 表示未在该子图中或未赋值）
+        // 线下保存可用 ofstream；此处仅输出到控制台
+        for (Eigen::Matrix4f& pose : poses_t)
         {
-            cout << pose << endl;
-            // ofs2 << pose << endl;
+            std::cout << pose << std::endl;
         }
-        // ofs2.close();
-        poses.push_back(poses_t);
 
+        // 推入输出容器：该子图的全局位姿解与 DFS 路径
+        poses.push_back(poses_t);
         nodes_seqs.push_back(nodes_seq);
     }
 }
@@ -1071,313 +1251,210 @@ Eigen::Matrix4f WHU::HL_MRF::inverse(Eigen::Matrix4f &mat)
 }
 
 /**
- * @brief 基于 PCL::registration::LUM 的全局位姿图优化。
+ * @brief 基于 PCL 的 LUM(Graph-SLAM) 全局细配准：以每个连通子图的初始位姿（相对其根节点）
+ *        为初值，迭代估计跨帧对应并优化所有顶点的姿态。
  *
- * 流程：
- * 1) 把各子图的点云加入 LUM（根节点用 Identity，其他节点用当前估计位姿转 6DoF）；
- * 2) 多次迭代，每次根据当前位姿重新估计相邻（按 DFS 路径覆盖）点云之间的互易对应；
- * 3) 运行 LUM 一次迭代（MaxIterations=1, Threshold=1e-3），更新各节点位姿；
- * 4) 输出每个子图的最终位姿到文本文件。
+ * @details
+ * 处理流程（对每个子图 f）：
+ *  1) 若该子图边数 < 2，则直接将 poses[f] 写盘后跳过（单节点或仅一条边，LUM 无实质优化）。
+ *  2) 构建 LUM 图：先将根节点云作为参考顶点 addPointCloud(root)，再将子图内其它已赋初值的节点以位姿 pose 加入。
+ *  3) 迭代 `LUM_iterations` 次：
+ *      a. 用当前 poses[f][i] 更新 LUM 顶点位姿（lum.setPose）。
+ *      b. 沿 DFS 路径 nodes_seqs[f] 为每条相邻节点对估计“互惠对应”（reciprocal correspondences）：
+ *         - 将 next 节点云按 T = inv(poses[f][curr]) * poses[f][next] 变换到 curr 坐标系；
+ *         - 用 `voxel_size_icp` 作为最大对应距离估计互惠对应；
+ *         - 以 (idx_next, idx_curr) 的图顶点索引写入 LUM 的边约束（lum.setCorrespondences）。
+ *      c. 设置 LUM 的单步求解参数（max iters = 1，收敛阈值 1e-3），调用 `lum.compute()` 优化整图。
+ *      d. 用 lum.getTransformation(i) 回写 poses[f][LUM_indices_map_inv_[f][i]]。
+ *  4) 优化完成后，将各顶点的最终变换写盘，同时同步回 poses[f]。
+ *
+ * 关键索引结构：
+ *  - LUM_indices_map_[f][scan_id]      : 由“全局扫描 id”映射到“LUM 图内顶点序号（连续）”。
+ *  - LUM_indices_map_inv_[f][lum_idx]  : 与上相反，由“LUM 顶点序号”映射回“全局扫描 id”。
+ *
+ * @param[in,out] poses         逐子图的全局姿态解（作为 LUM 初值与最终回写容器）；poses[f][i] 为 4x4 齐次矩阵。
+ *                              未参与本子图或未初始化的元素通常为 Zero 矩阵。
+ * @param[in]     edges         逐子图的 MST 边索引（仅用于判断子图是否可做 LUM，内部流程不直接使用）。
+ * @param[in]     root          每个子图的根节点全局扫描 id（作为参考帧）。
+ * @param[in]     nodes_seqs    逐子图的 DFS 路径集合；nodes_seqs[f][k] 是一条从 root[f] 出发的顶点序列。
+ * @param[in]     LUM_indices_map_     f 维度的二维映射：scan_id -> lum_vertex_idx。
+ * @param[in]     LUM_indices_map_inv_ f 维度的二维映射：lum_vertex_idx -> scan_id。
+ * @param[in]     num_of_subtrees      连通子图数量。
+ * @param[in]     clouds       所有扫描的点云数组（与全局 scan id 对齐）。
+ *
+ * @pre  已通过 GROR/ICP 等生成子图的初始位姿（poses[f]），且 LUM 的索引映射已构建完毕。
+ * @post poses[f] 将被 LUM 的优化结果覆盖；会在工程输出目录生成每个子图的最终变换文本。
+ *
+ * @note
+ * - 对应估计使用 reciprocal correspondences，距离阈值为 @c voxel_size_icp（单位：m）。
+ * - 并行部分（OpenMP）包含 `#pragma omp critical` 以避免跨线程写 LUM/visited 集时的数据竞争。
+ * - 当 `use_LUM == false` 时此函数不做任何操作。
+ * - I/O：结果保存到 `output_dir + filename.str() + "_Mst" + <f> + ".txt"`。
  */
-
-void WHU::HL_MRF::LUMoptimization(std::vector<std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>> &poses,
-                                  std::vector<std::vector<size_t>> &edges,
-                                  std::vector<int> &root,
-                                  std::vector<std::vector<pcl::Indices>> &nodes_seqs,
-                                  std::vector<std::vector<int>> &LUM_indices_map_,
-                                  std::vector<std::vector<int>> &LUM_indices_map_inv_,
-                                  int num_of_subtrees,
-                                  std::vector<pcl::PointCloud<PointT>::Ptr> &clouds)
+void WHU::HL_MRF::LUMoptimization(std::vector<std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>>& poses,
+    std::vector<std::vector<size_t>>& edges,
+    std::vector<int>& root,
+    std::vector<std::vector<pcl::Indices>>& nodes_seqs,
+    std::vector<std::vector<int>>& LUM_indices_map_,
+    std::vector<std::vector<int>>& LUM_indices_map_inv_,
+    int num_of_subtrees,
+    std::vector<pcl::PointCloud<PointT>::Ptr>& clouds)
 {
     if (use_LUM)
     {
-
-        std::set<int> visited;
+        // 复用容器（每个子图的对应关系集合）；目前未持久化，仅示例保留
+        std::set<int> visited; // 记录某轮中已作为“next”参与过对应估计的节点，避免重复
         std::vector<std::vector<pcl::CorrespondencesPtr>> correspondences(edges.size());
 
-        //*********************** apply lum global fine registration ***********************//
+        //================ LUM 全局细配准（逐子图） ================//
         for (int f = 0; f < num_of_subtrees; f++)
         {
-            int q = 0;
+            int q = 0; // 历史遗留/调试计数器（当前未使用）
             std::stringstream ss;
             ss << f;
+
+            // 子图边数过少（<2）则直接落盘 poses[f]，不做 LUM
             if (edges[f].size() < 2)
             {
                 std::ofstream ofs3(output_dir + filename.str() + "_Mst" + ss.str() + ".txt");
-                cout << "...saving results to files" << endl;
+                std::cout << "...saving results to files" << std::endl;
                 for (int i = 0; i < nr_scans; i++)
                 {
                     if (poses[f][i].isZero())
-                    {
-                        continue;
-                    }
+                        continue; // 该 scan 不在本子图内或未初始化
+
                     ofs3 << "affine transformation: \n";
-
-                    ofs3 << poses[f][i];
-
-                    ofs3 << "\n";
+                    ofs3 << poses[f][i] << "\n";
                 }
                 ofs3.close();
                 continue;
             }
 
+            // 构造并初始化 LUM 图优化器
             pcl::registration::LUM<PointT> lum;
-            cout << "apply lum global matching..\n";
+            std::cout << "apply lum global matching..\n";
 
+            // 1) 将根节点云作为参考顶点加入（无初值姿态）
             lum.addPointCloud(clouds[root[f]]);
+
+            // 2) 将子图内其它已初始化节点，按“当前全局位姿”作为初值加入 LUM 顶点
             for (int i = 0; i < nr_scans; i++)
             {
-                if (i == root[f])
-                    continue;
-                if (poses[f][i].isZero())
-                {
-                    continue;
-                }
-                Eigen::Transform<float, 3, Eigen::Affine> aff(poses[f][i]);
-                Eigen::Vector6f pose;
-                pcl::getTranslationAndEulerAngles(aff, pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]);
+                if (i == root[f]) continue;
+                if (poses[f][i].isZero()) continue; // 未在子图中或未初始化
+
+                // 将 4x4 齐次矩阵转换为 xyz + rpy（弧度），以满足 LUM 接口
+                const Eigen::Transform<float, 3, Eigen::Affine> aff(poses[f][i]);
+                Eigen::Vector6f pose; // [x y z roll pitch yaw]
+                pcl::getTranslationAndEulerAngles(aff, pose[0], pose[1], pose[2],
+                    pose[3], pose[4], pose[5]);
                 lum.addPointCloud(clouds[i], pose);
             }
 
-            int iteration_ = LUM_iterations;
+            // 3) LUM 迭代求解（外层控制总迭代次数）
+            const int iteration_ = LUM_iterations;
             for (int li = 0; li < iteration_; li++)
             {
-                visited.clear();
+                visited.clear(); // 每轮只允许某 next 节点参与一次“被估计”，减少重复对应
 
-                cout << "...get correspondences\n";
+                std::cout << "...get correspondences\n";
+
+                // 3.a 用当前 poses 更新 LUM 顶点位姿
                 for (int i = 0; i < nr_scans; i++)
                 {
-                    if (i == root[f])
-                        continue;
-                    if (poses[f][i].isZero())
-                    {
-                        continue;
-                    }
-                    Eigen::Transform<float, 3, Eigen::Affine> aff(poses[f][i]);
+                    if (i == root[f]) continue;
+                    if (poses[f][i].isZero()) continue;
+
+                    const Eigen::Transform<float, 3, Eigen::Affine> aff(poses[f][i]);
                     Eigen::Vector6f pose;
-                    pcl::getTranslationAndEulerAngles(aff, pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]);
+                    pcl::getTranslationAndEulerAngles(aff, pose[0], pose[1], pose[2],
+                        pose[3], pose[4], pose[5]);
+                    // 通过映射表将“全局 scan id”定位到 LUM 顶点序号
                     lum.setPose(LUM_indices_map_[f][i], pose);
                 }
-                std::vector<pcl::CorrespondencesPtr> correspondences_t;
 
-                for (int i = 0; i < nodes_seqs[f].size(); i++)
+                // 3.b 沿 DFS 路径为相邻节点对估计“互惠对应”，并写入 LUM 的边
+                std::vector<pcl::CorrespondencesPtr> correspondences_t; // 当前轮的临时集合（保留变量以便扩展）
+
+                for (int i = 0; i < static_cast<int>(nodes_seqs[f].size()); i++)
                 {
-
+                    // 对路径上的相邻对 (curr -> next) 并行估计
 #pragma omp parallel for num_threads(num_threads)
-                    for (int j = 0; j < nodes_seqs[f][i].size() - 1; j++)
+                    for (int j = 0; j < static_cast<int>(nodes_seqs[f][i].size()) - 1; j++)
                     {
-                        if (std::find(visited.begin(), visited.end(), nodes_seqs[f][i][j + 1]) == visited.end())
+                        const int curr = nodes_seqs[f][i][j];
+                        const int next = nodes_seqs[f][i][j + 1];
+
+                        // 本轮中若 next 尚未被作为“源”处理，则进行一次对应估计
+                        if (std::find(visited.begin(), visited.end(), next) == visited.end())
                         {
                             pcl::registration::CorrespondenceEstimation<PointT, PointT> correspondence_estimate;
                             pcl::CorrespondencesPtr temp(new pcl::Correspondences);
-                            pcl::PointCloud<PointT>::Ptr temp2(new pcl::PointCloud<PointT>());
-                            pcl::transformPointCloud(*clouds[nodes_seqs[f][i][j + 1]], *temp2, inverse(poses[f][nodes_seqs[f][i][j]]) * poses[f][nodes_seqs[f][i][j + 1]]);
-                            correspondence_estimate.setInputSource(temp2);
-                            correspondence_estimate.setInputTarget(clouds[nodes_seqs[f][i][j]]);
+                            pcl::PointCloud<PointT>::Ptr src_in_curr(new pcl::PointCloud<PointT>());
+
+                            // 将 next 的点云用 T = inv(Pose(curr)) * Pose(next) 变换到 curr 坐标系
+                            // 这里 inverse(...) 为 4x4 齐次姿态求逆；若使用 Eigen 也可 poses[f][curr].inverse()
+                            pcl::transformPointCloud(
+                                *clouds[next], *src_in_curr,
+                                inverse(poses[f][curr]) * poses[f][next]
+                            );
+
+                            // 源 = 变换后的 next（在 curr 坐标系），目标 = curr 原始云
+                            correspondence_estimate.setInputSource(src_in_curr);
+                            correspondence_estimate.setInputTarget(clouds[curr]);
+
+                            // 互惠对应估计；最大对应距离 = voxel_size_icp
                             correspondence_estimate.determineReciprocalCorrespondences(*temp, voxel_size_icp);
+
+                            // 将对应与“访问标记”写入共享状态，需临界区保护
 #pragma omp critical
                             {
-                                visited.insert(nodes_seqs[f][i][j + 1]);
-                                cout << i << ":" << "correspondences sizes: " << (*temp).size() << "\n";
-                                lum.setCorrespondences(LUM_indices_map_[f][nodes_seqs[f][i][j + 1]], LUM_indices_map_[f][nodes_seqs[f][i][j]], temp);
+                                visited.insert(next);
+                                std::cout << i << ":" << "correspondences sizes: " << temp->size() << "\n";
+                                // 将 (next -> curr) 的对应放入 LUM：参数为 LUM 顶点索引
+                                lum.setCorrespondences(
+                                    LUM_indices_map_[f][next],
+                                    LUM_indices_map_[f][curr],
+                                    temp
+                                );
                             }
                         }
                     }
                 }
 
+                // 3.c LUM 单步优化（外层循环控制总步数）
                 lum.setMaxIterations(1);
-                lum.setConvergenceThreshold(0.001);
-                cout << "perform lum optimization...\n";
+                lum.setConvergenceThreshold(0.001f);
+                std::cout << "perform lum optimization...\n";
                 lum.compute();
-                pcl::PointCloud<PointT>::Ptr cloud_out(new pcl::PointCloud<PointT>());
+
+                // 3.d 将 LUM 的当前顶点解回写到 poses[f]
+                //     通过 inv-map 将 lum 顶点序号映射回全局 scan id
                 for (int i = 0; i < lum.getNumVertices(); i++)
                 {
                     poses[f][LUM_indices_map_inv_[f][i]] = lum.getTransformation(i).matrix();
                 }
-            }
-            //				}
-            //					set<int> visited;
-            //					vector< vector<pcl::CorrespondencesPtr>> correspondences(edges.size());
-            //					//vector< vector<pcl::CorrespondencesPtr>> inv_correspondences(edges.size());
-            //
-            //					//*********************** apply lum global fine registration ***********************//
-            //					for (int f = 0; f < flag + 1; f++)
-            //					{
-            //
-            //						int q = 0;
-            //						stringstream ss;
-            //						ss << f;
-            //						if (edges[f].size() < 2)
-            //						{
-            //							ofstream ofs3(R"(D:\Programming\global_consistency\build\result\fine registration.txt)" + filename.str() + "_Mst" + ss.str() + ".txt");
-            //							cout << "...saving results to files" << endl;
-            //							for (int i = 0; i < nr_scans; i++)
-            //							{
-            //								if (poses[f][i].isZero())
-            //								{
-            //									continue;
-            //								}
-            //								ofs3 << "affine transformation: \n";
-            //
-            //								ofs3 << poses[f][i];
-            //
-            //								ofs3 << "\n";
-            //							}
-            //							ofs3.close();
-            //							continue;
-            //						}
-            //
-            //						//ii = edge.begin();
-            //						pcl::registration::LUM<PointT> lum;
-            //						cout << "apply lum global matching..\n";
-            //						//  Add point clouds as vertices to the SLAM graph
-            //						//lum.addPointCloud(clouds[0]);
-            //						//锟斤拷root为锟轿匡拷帧
-            //						lum.addPointCloud(clouds[root[f]]);
-            //						for (int i = 0; i < nr_scans; i++)
-            //						{
-            //							if (i == root[f])
-            //								continue;
-            //							if (poses[f][i].isZero())
-            //							{
-            //								continue;
-            //							}
-            //							Eigen::Transform<float, 3, Eigen::Affine>  aff(poses[f][i]);
-            //							Eigen::Vector6f pose;
-            //							pcl::getTranslationAndEulerAngles(aff, pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]);
-            //							lum.addPointCloud(clouds[i], pose);
-            //						}
-            //						// Use your favorite pairwise correspondence estimation algorithm(s)
-            //						//Add the correspondence results as edges to the SLAM graph
-            //						int iteration_ = atoi(argv[10]);
-            //						for (int li = 0; li < iteration_; li++)
-            //						{
-            //							visited.clear();
-            //							vector<bool> after_check_graph_pairs_visited(after_check_graph_pairs.size(), false);
-            //							for (int i = 0; i < edges.size(); i++)
-            //							{
-            //								if (i == f)
-            //									continue;
-            //								for (int j = 0; j < edges[i].size(); j++)
-            //								{
-            //									after_check_graph_pairs_visited[edges[i][j]] = true;
-            //								}
-            //							}
-            //
-            //							cout << "...get correspondences\n";
-            //							for (int i = 0; i < nr_scans; i++)
-            //							{
-            //								if (i == root[f])
-            //									continue;
-            //								if (poses[f][i].isZero())
-            //								{
-            //									continue;
-            //								}
-            //								Eigen::Transform<float, 3, Eigen::Affine>  aff(poses[f][i]);
-            //								Eigen::Vector6f pose;
-            //								pcl::getTranslationAndEulerAngles(aff, pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]);
-            //								lum.setPose(LUM_indices_map_[f][i], pose);
-            //							}
-            //							vector<pcl::CorrespondencesPtr> correspondences_t;
-            //							//#pragma omp parallel for num_threads(8)
-            //							cout << "odometry case:\n";
-            //
-            // #pragma omp parallel for num_threads(16)
-            //							for (int j = 0; j < edges[f].size(); j++)
-            //							{
-            //
-            //								pcl::registration::CorrespondenceEstimation<PointT, PointT> correspondence_estimate;
-            //								pcl::CorrespondencesPtr temp(new pcl::Correspondences);
-            //								pcl::PointCloud<PointT>::Ptr temp2(new PointCloud<PointT>());
-            //								pcl::transformPointCloud(*clouds[after_check_graph_pairs[edges[f][j]].second], *temp2, inverse(poses[f][after_check_graph_pairs[edges[f][j]].first])* poses[f][after_check_graph_pairs[edges[f][j]].second]);
-            //								correspondence_estimate.setInputSource(temp2);
-            //								correspondence_estimate.setInputTarget(clouds[after_check_graph_pairs[edges[f][j]].first]);
-            //								correspondence_estimate.determineReciprocalCorrespondences(*temp, atof(argv[11]));
-            //							#pragma omp critical
-            //								{
-            //									//visited.insert(nodes_seqs[f][i][j + 1]);
-            //									cout << j << ":" << "correspondences sizes: " << (*temp).size() << "\n";
-            //									//correspondences_t.push_back(temp);
-            //									lum.setCorrespondences(LUM_indices_map_[f][after_check_graph_pairs[edges[f][j]].second], LUM_indices_map_[f][after_check_graph_pairs[edges[f][j]].first], temp);
-            //								}
-            //								after_check_graph_pairs_visited[edges[f][j]] = true;
-            //
-            //							}
-            //							cout << "loop closure case:\n";
-            ////#pragma omp parallel for num_threads(16)
-            ////							for (int j = 0; j < after_check_graph_pairs_visited.size(); j++)
-            ////							{
-            ////								if (after_check_graph_pairs_visited[j] == true)
-            ////									continue;
-            ////								cout << "loop found!\n";
-            ////								pcl::registration::CorrespondenceEstimation<PointT, PointT> correspondence_estimate;
-            ////								pcl::CorrespondencesPtr temp(new pcl::Correspondences);
-            ////								pcl::PointCloud<PointT>::Ptr temp2(new PointCloud<PointT>());
-            ////								pcl::transformPointCloud(*clouds[after_check_graph_pairs[j].second], *temp2, inverse(poses[f][after_check_graph_pairs[j].first])* poses[f][after_check_graph_pairs[j].second]);
-            ////								correspondence_estimate.setInputSource(temp2);
-            ////								correspondence_estimate.setInputTarget(clouds[after_check_graph_pairs[j].first]);
-            ////								correspondence_estimate.determineReciprocalCorrespondences(*temp, atof(argv[11]));
-            ////							#pragma omp critical
-            ////								{
-            ////									//visited.insert(nodes_seqs[f][i][j + 1]);
-            ////									cout << j << ":" << "correspondences sizes: " << (*temp).size() << "\n";
-            ////									//correspondences_t.push_back(temp);
-            ////									lum.setCorrespondences(LUM_indices_map_[f][after_check_graph_pairs[j].second], LUM_indices_map_[f][after_check_graph_pairs[j].first], temp);
-            ////								}
-            ////								after_check_graph_pairs_visited[j] = true;
-            ////							}
-            //
-            //							//correspondences[f] = correspondences_t;
-            //							/*for (int i = 0; i < nodes_seqs[f].size(); i++)
-            //							{
-            //								for (int j = 0; j < nodes_seqs[f][i].size() - 1; j++)
-            //								{
-            //									if (correspondences[f][q]->size() < 5000)
-            //										continue;
-            //
-            //									q++;
-            //								}
-            //
-            //							}*/
-            //							//  Change the computation parameters
-            //							lum.setMaxIterations(1);
-            //							lum.setConvergenceThreshold(0.001);
-            //							//Perform the actual LUM computation
-            //							cout << "perform lum optimization...\n";
-            //							lum.compute();
-            //							// Return the concatenated point cloud result
-            //							pcl::PointCloud<PointT>::Ptr cloud_out(new pcl::PointCloud<PointT>());
-            //							//cloud_out = lum.getConcatenatedCloud();
-            //							for (int i = 0; i < lum.getNumVertices(); i++)
-            //							{
-            //								poses[f][LUM_indices_map_inv_[f][i]] = lum.getTransformation(i).matrix();
-            //							}
-            //						}
-            //
+            } // for li (LUM_iterations)
+
+            // 4) 最终结果落盘（并再次同步一遍，保证一致）
             std::ofstream ofs3(output_dir + filename.str() + "_Mst" + ss.str() + ".txt");
-            cout << "...saving results to files" << endl;
+            std::cout << "...saving results to files" << std::endl;
             for (int i = 0; i < lum.getNumVertices(); i++)
             {
                 ofs3 << "affine transformation: \n";
                 ofs3 << lum.getTransformation(i).matrix();
                 poses[f][LUM_indices_map_inv_[f][i]] = lum.getTransformation(i).matrix();
-                if (i == (lum.getNumVertices() - 1))
-                    break;
+                if (i == (lum.getNumVertices() - 1)) break;
                 ofs3 << "\n";
             }
             ofs3.close();
 
+            // 可视化调试（保留注释）
             // pcl::visualization::PCLVisualizer vis;
-            ////for (int i = 0; i < nr_scans; i++)
-            ////{
-            ////    stringstream ss;
-            ////    ss << "cloud" << i;
-            ////    vis.addPointCloud(clouds[i], ss.str());
-            ////}
             // vis.addPointCloud(cloud_out, "clouds");
             // vis.spin();
-        }
-    }
+        } // for f
+    } // if(use_LUM)
 }
 
 void WHU::HL_MRF::solveGlobalPose()

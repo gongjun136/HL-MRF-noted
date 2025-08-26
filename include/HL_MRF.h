@@ -65,7 +65,14 @@ namespace WHU
 	class HL_MRF
 	{
 		using PointT = pcl::PointXYZ;
-
+		// 使用 Boost 子图：顶点/边容器 vecS，Undirected 图；顶点/边可携带 index，边可携带权重。
+		typedef boost::subgraph<
+			boost::adjacency_list<
+			boost::vecS, boost::vecS, boost::undirectedS,
+			boost::property<boost::vertex_index_t, int>,
+			boost::property<boost::edge_index_t, int,
+			boost::property<boost::edge_weight_t, float>>>>
+			Graph;
 
 	public:
 

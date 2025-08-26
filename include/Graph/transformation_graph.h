@@ -81,9 +81,9 @@ namespace pcl
             typedef std::vector<int> Indices;
             typedef std::vector<Indices> IndicesList;
 
-            typedef std::pair<int, bool> DirectedIndex;
-            typedef std::vector<DirectedIndex> DirectedIndices;
-            typedef std::vector<DirectedIndices> DirectedIndicesList;
+            typedef std::pair<int, bool> DirectedIndex;                     // 当前边的id、顺逆
+            typedef std::vector<DirectedIndex> DirectedIndices;             // 环路的所有有向边
+            typedef std::vector<DirectedIndices> DirectedIndicesList;       // 所有的环路
             /** \endcond */
 
             /** \brief Constructor. */
